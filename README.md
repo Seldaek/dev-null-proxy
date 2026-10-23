@@ -5,8 +5,10 @@ dev-null.sh is pretty cool but I thought it's sad we can't address it as /dev/nu
 Open [https://dev/null](https://dev/null) in your browser and get [dev-null.sh](https://dev-null.sh).
 
 A tiny local HTTPS reverse proxy written in PHP (on [amphp](https://amphp.org)) that serves dev-null.sh at
-`https://dev/null`, GitHub sign in included. It also gives you `/dev/NULL` and `/dev/null​` files you
-can pipe stuff to to be social from your terminal: `echo 'Hello!' > /dev/NULL`.
+`https://dev/null`, GitHub sign in included. It also gives you files you can pipe stuff to to be social
+from your terminal `/dev/NULL` and `/dev/null​` (there is a zero-width-space following here, you just can't
+see it, this will not break your real /dev/null nor fill your disk with bullshit). Once setup you can 
+`echo 'Hello!' > /dev/NULL`.
 
 Runs on Linux, macOS and WSL (with the browser on Windows).
 
