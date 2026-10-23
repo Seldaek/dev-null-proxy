@@ -147,6 +147,8 @@ If you use a different hostname, `--no-tls --port=80` serves plain HTTP instead.
   and to redirects: you stay on `https://dev/null/…`, and reloading lands on the same page.
 - Absolute `https://dev-null.sh` URLs in pages and headers point back at the proxy, and cookies lose their
   `Domain` so the browser keeps them for `dev`.
+- Links never leak the other way: `https://dev/…` and `https://dev/null/…` links in what you post become
+  `https://dev-null.sh/…`, and the site's copy and share buttons hand out `https://dev-null.sh/…` links.
 
 ## Commands and options
 

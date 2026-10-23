@@ -2,6 +2,7 @@
 
 namespace DevNullProxy;
 
+use Amp\Http\Client\BufferedContent;
 use Amp\Http\Client\HttpClient;
 use Amp\Http\Client\HttpClientBuilder;
 use Amp\Http\Client\HttpException;
@@ -21,6 +22,8 @@ final class ProxyHandler implements RequestHandler
     private const REWRITE_TYPES = ['text/html', 'application/json', 'text/css', 'application/javascript', 'text/javascript', 'application/xml', 'text/xml', 'application/manifest+json'];
     // uploads (photos in commits and replies) and downloads alike
     private const MAX_BODY_SIZE = 512 * 1024 * 1024;
+    // request bodies that may carry links typed or pasted by the user
+    private const OUTGOING_REWRITE_TYPES = ['application/json', 'text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data'];
     private const GITHUB_AUTHORIZE = 'https://github.com/login/oauth/authorize';
 
     private readonly HttpClient $client;
@@ -65,7 +68,13 @@ final class ProxyHandler implements RequestHandler
         }
         $target = $this->upstream.$path.($uri->getQuery() !== '' ? '?'.$uri->getQuery() : '');
 
-        $upstreamResponse = $this->forward($request, $target, ['accept-encoding' => null], fn (string $v) => $this->toUpstream($v, $origin));
+        $upstreamResponse = $this->forward(
+            $request,
+            $target,
+            ['accept-encoding' => null],
+            fn (string $v) => $this->toUpstream($v, $origin),
+            fn (string $body, string $contentType) => $this->rewriteOutgoingBody($body, $contentType, $origin),
+        );
         if ($upstreamResponse instanceof Response) {
             return $upstreamResponse;
         }
@@ -96,6 +105,10 @@ final class ProxyHandler implements RequestHandler
                 $body = $this->prefixInertiaPage($body);
             }
             $body = $this->toLocal($body, $origin);
+            if ($contentType === 'text/html') {
+                // after toLocal(), which would point the script's upstream URL back at the proxy
+                $body = $this->injectClipboardFix($body, $origin);
+            }
         } else {
             $body = $upstreamResponse->getBody();
             if (null !== ($length = $upstreamResponse->getHeader('content-length')) && !$upstreamResponse->hasHeader('content-encoding')) {
@@ -277,8 +290,9 @@ final class ProxyHandler implements RequestHandler
     /**
      * @param array<string, list<string>|null> $overrides headers to replace, or drop when null
      * @param (\Closure(string): string)|null $toUpstream rewrites origin/referer
+     * @param (\Closure(string, string): string)|null $rewriteBody rewrites text request bodies, given the content type
      */
-    private function forward(Request $request, string $target, array $overrides = [], ?\Closure $toUpstream = null): ClientResponse|Response
+    private function forward(Request $request, string $target, array $overrides = [], ?\Closure $toUpstream = null, ?\Closure $rewriteBody = null): ClientResponse|Response
     {
         $upstreamRequest = new ClientRequest($target, $request->getMethod());
         $upstreamRequest->setTransferTimeout(300);
@@ -300,12 +314,17 @@ final class ProxyHandler implements RequestHandler
         if (!in_array($request->getMethod(), ['GET', 'HEAD'], true)) {
             // amphp's server caps request bodies at 128 KB by default
             $request->getBody()->increaseSizeLimit(self::MAX_BODY_SIZE);
-            $length = $request->getHeader('content-length');
-            $upstreamRequest->setBody(StreamedContent::fromStream(
-                $request->getBody(),
-                $length !== null ? (int) $length : null,
-                $request->getHeader('content-type'),
-            ));
+            $contentType = (string) $request->getHeader('content-type');
+            if ($rewriteBody !== null && in_array(strtolower(trim(explode(';', $contentType)[0])), self::OUTGOING_REWRITE_TYPES, true)) {
+                $upstreamRequest->setBody(BufferedContent::fromString($rewriteBody($request->getBody()->buffer(), $contentType), $contentType));
+            } else {
+                $length = $request->getHeader('content-length');
+                $upstreamRequest->setBody(StreamedContent::fromStream(
+                    $request->getBody(),
+                    $length !== null ? (int) $length : null,
+                    $contentType !== '' ? $contentType : null,
+                ));
+            }
         }
 
         try {
@@ -388,6 +407,83 @@ final class ProxyHandler implements RequestHandler
         }
 
         return $this->prefix.($path === '/' ? substr($url, 1) : $url);
+    }
+
+    /**
+     * Links copied on the proxy point at it, so posted as they are they'd be dead for everyone else.
+     */
+    private function linksToUpstream(string $text, string $origin): string
+    {
+        // https://dev and https://dev/null (also at the end of a sentence), but not https://dev-null.sh or https://devtools
+        $pattern = '{'.preg_quote($origin).'(?:'.preg_quote($this->localRoot()).'(?![\w-])|(?![\w.:-]))}';
+
+        return preg_replace($pattern, $this->upstream, $text) ?? $text;
+    }
+
+    private function rewriteOutgoingBody(string $body, string $contentType, string $origin): string
+    {
+        $type = strtolower(trim(explode(';', $contentType)[0]));
+        if ($type === 'application/x-www-form-urlencoded') {
+            return implode('&', array_map(function (string $pair) use ($origin) {
+                [$name, $value] = explode('=', $pair, 2) + [1 => null];
+                if ($value === null || ($decoded = urldecode($value)) === ($rewritten = $this->linksToUpstream($decoded, $origin))) {
+                    return $pair;
+                }
+
+                return $name.'='.urlencode($rewritten);
+            }, explode('&', $body)));
+        }
+        if ($type !== 'multipart/form-data') {
+            return $this->linksToUpstream($body, $origin);
+        }
+
+        if (!preg_match('{boundary="?([^";]+)"?}i', $contentType, $m)) {
+            return $body;
+        }
+        $delimiter = '--'.$m[1];
+        $parts = explode($delimiter, $body);
+        foreach ($parts as $i => $part) {
+            $split = strpos($part, "\r\n\r\n");
+            // uploaded files stay untouched
+            if ($split === false || stripos(substr($part, 0, $split), 'filename=') !== false) {
+                continue;
+            }
+            $parts[$i] = substr($part, 0, $split + 4).$this->linksToUpstream(substr($part, $split + 4), $origin);
+        }
+
+        return implode($delimiter, $parts);
+    }
+
+    /**
+     * The site's copy and share buttons build links from location.origin, make them share the real site.
+     */
+    private function injectClipboardFix(string $html, string $origin): string
+    {
+        if (false === ($head = stripos($html, '<head')) || false === ($end = strpos($html, '>', $head))) {
+            return $html;
+        }
+        $flags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_UNESCAPED_SLASHES;
+        $script = sprintf(<<<'JS'
+            <script>(() => {
+                const local = new RegExp(%s + '(?:' + %s + '(?![\\w-])|(?![\\w.:-]))', 'g');
+                const fix = (value) => typeof value === 'string' ? value.replace(local, %s) : value;
+                const clipboard = navigator.clipboard;
+                if (clipboard?.writeText) {
+                    const writeText = clipboard.writeText.bind(clipboard);
+                    clipboard.writeText = (text) => writeText(fix(text));
+                }
+                if (navigator.share) {
+                    const share = navigator.share.bind(navigator);
+                    navigator.share = (data) => share({ ...data, url: fix(data?.url), text: fix(data?.text) });
+                }
+            })();</script>
+            JS,
+            json_encode(preg_quote($origin), $flags),
+            json_encode(preg_quote($this->localRoot()), $flags),
+            json_encode($this->upstream, $flags),
+        );
+
+        return substr_replace($html, $script, $end + 1, 0);
     }
 
     private function toUpstream(string $value, string $origin): string
