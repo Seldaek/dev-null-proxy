@@ -1,0 +1,18 @@
+{
+    "description": "Local HTTPS proxy so https://dev/null serves dev-null.sh",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.4",
+        "ext-openssl": "*",
+        "ext-pcntl": "*",
+        "ext-posix": "*",
+        "amphp/http-server": "^3",
+        "amphp/http-client": "^5",
+        "amphp/log": "^2"
+    },
+    "autoload": {
+        "psr-4": { "DevNullProxy\\": "src/" }
+    },
+    "bin": ["bin/dev-null-proxy"]
+}

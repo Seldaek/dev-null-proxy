@@ -1,0 +1,176 @@
+#!/usr/bin/env php
+<?php declare(strict_types=1);
+
+use Amp\ByteStream;
+use Amp\Http\HttpStatus;
+use Amp\Http\Server\DefaultErrorHandler;
+use Amp\Http\Server\Request;
+use Amp\Http\Server\RequestHandler\ClosureRequestHandler;
+use Amp\Http\Server\Response;
+use Amp\Http\Server\SocketHttpServer;
+use Amp\Log\ConsoleFormatter;
+use Amp\Log\StreamHandler;
+use Amp\Socket\BindContext;
+use Amp\Socket\Certificate;
+use Amp\Socket\ServerTlsContext;
+use DevNullProxy\CertificateAuthority;
+use DevNullProxy\ProxyHandler;
+use DevNullProxy\TrustInstaller;
+use DevNullProxy\UpstreamDnsResolver;
+use Monolog\Level;
+use Monolog\Logger;
+
+foreach ([__DIR__.'/../vendor/autoload.php', __DIR__.'/../../../autoload.php'] as $autoload) {
+    if (is_file($autoload)) {
+        require $autoload;
+        break;
+    }
+}
+
+$usage = <<<'TXT'
+    Usage: dev-null-proxy [command] [options]
+
+    Commands:
+      serve      Run the proxy (default)
+      trust      Create the local CA and add it to your OS trust store
+      ca-path    Print the path to the local CA certificate
+
+      install-pipe    Create /dev/NULL (and /dev/null<U+200B>), needs sudo
+      pipe            Commit whatever gets written to /dev/NULL, e.g. echo 'Hello!' > /dev/NULL
+      uninstall-pipe  Remove them again, needs sudo
+
+    Options:
+      --host=NAME       Hostname the certificate is issued for (default: dev)
+      --port=N          Listen port (default: 443, or 80 with --no-tls)
+      --http-port=N     Also listen on plain HTTP and redirect to HTTPS (default: off)
+      --listen=IP       Address to bind (default: 127.0.0.1)
+      --upstream=URL    Site to proxy (default: https://dev-null.sh)
+      --prefix=PATH     Local path mapped to the upstream root (default: /null)
+      --no-tls          Serve plain HTTP (won't work for "dev", it is HSTS-preloaded)
+      --behind-proxy    Another server (e.g. nginx) forwards port 443 to this one
+      -v                Log every request
+      --path=FILE       Pipe to use (default: /dev/NULL)
+      --no-alias        Don't create the invisible /dev/null<U+200B> alias
+
+    TXT;
+
+$command = 'serve';
+$opts = ['host' => 'dev', 'port' => null, 'http-port' => null, 'listen' => '127.0.0.1', 'upstream' => 'https://dev-null.sh', 'prefix' => '/null', 'no-tls' => false, 'behind-proxy' => false, 'v' => false, 'path' => null, 'no-alias' => false];
+foreach (array_slice($argv, 1) as $arg) {
+    if (preg_match('{^--?([a-z-]+)(?:=(.*))?$}', $arg, $m)) {
+        if (!array_key_exists($m[1], $opts)) {
+            fwrite(STDERR, "Unknown option $arg\n\n$usage");
+            exit(1);
+        }
+        $opts[$m[1]] = $m[2] ?? true;
+    } elseif (in_array($arg, ['serve', 'trust', 'ca-path', 'help', 'pipe', 'install-pipe', 'uninstall-pipe'], true)) {
+        $command = $arg;
+    } else {
+        fwrite(STDERR, "Unknown argument $arg\n\n$usage");
+        exit(1);
+    }
+}
+
+$out = static fn (string $msg) => fwrite(STDOUT, preg_replace('{</?error>}', '', $msg)."\n");
+$err = static fn (string $msg) => fwrite(STDERR, $msg."\n");
+$ca = new CertificateAuthority(CertificateAuthority::defaultDir());
+
+// the hosts file may point the upstream at the proxy itself, both the proxy and the pipe need the real one
+$upstreamHost = strtolower((string) parse_url($opts['upstream'], PHP_URL_HOST));
+Amp\Dns\dnsResolver($dns = new UpstreamDnsResolver(Amp\Dns\createDefaultResolver(), $upstreamHost));
+
+switch ($command) {
+    case 'help':
+        echo $usage;
+        exit(0);
+
+    case 'ca-path':
+        $ca->ensureCa();
+        echo $ca->caCertPath(), "\n";
+        exit(0);
+
+    case 'install-pipe':
+    case 'uninstall-pipe':
+    case 'pipe':
+        $path = is_string($opts['path']) ? $opts['path'] : DevNullProxy\Pipe::DEFAULT_PATH;
+        $alias = $opts['no-alias'] || is_string($opts['path']) ? null : DevNullProxy\Pipe::DEFAULT_ALIAS;
+        try {
+            match ($command) {
+                'install-pipe' => DevNullProxy\Pipe::install($path, $alias, $out),
+                'uninstall-pipe' => DevNullProxy\Pipe::uninstall($path, $alias, $out),
+                'pipe' => DevNullProxy\Pipe::serve($path, new DevNullProxy\Committer($opts['upstream']), $out, $err),
+            };
+        } catch (\RuntimeException $e) {
+            $err($e->getMessage());
+            exit(1);
+        }
+        exit(0);
+
+    case 'trust':
+        $ca->ensureCa();
+        $out('Local CA: '.$ca->caCertPath());
+        $ok = (new TrustInstaller())->install($ca->caCertPath(), $out);
+        $out($ok ? 'Done. Restart your browser if it was open.' : 'Trust installation failed, see above.');
+        exit($ok ? 0 : 1);
+}
+
+$tls = !$opts['no-tls'];
+$port = (int) ($opts['port'] ?? ($tls ? 443 : 80));
+$httpPort = $opts['http-port'] !== null ? (int) $opts['http-port'] : null;
+
+$logHandler = new StreamHandler(ByteStream\getStdout(), $opts['v'] ? Level::Info : Level::Warning);
+$logHandler->setFormatter(new ConsoleFormatter());
+$logger = new Logger('dev-null-proxy', [$logHandler]);
+// amphp leaves the odd unawaited future behind on failed upstream requests, don't let that kill the proxy
+Revolt\EventLoop::setErrorHandler(static fn (\Throwable $e) => $logger->error('Unhandled error: '.$e->getMessage()));
+
+$proxy = new ProxyHandler($opts['upstream'], $opts['prefix'], $dns, $logger);
+// on the plain-http port of a TLS setup, just bounce to https
+$handler = new ClosureRequestHandler(static function (Request $request) use ($proxy, $tls, $port): Response {
+    if ($tls && $request->getClient()->getTlsInfo() === null) {
+        $uri = $request->getUri()->withScheme('https')->withPort($port === 443 ? null : $port);
+
+        return new Response(HttpStatus::PERMANENT_REDIRECT, ['location' => (string) $uri]);
+    }
+
+    return $proxy->handleRequest($request);
+});
+
+$server = SocketHttpServer::createForDirectAccess($logger, enableCompression: false, connectionLimitPerIp: 1000, allowedMethods: null);
+$bind = new BindContext();
+if ($tls) {
+    [$certFile, $keyFile] = $ca->leafFor([$opts['host'], $upstreamHost]);
+    $bind = $bind->withTlsContext((new ServerTlsContext())->withDefaultCertificate(new Certificate($certFile, $keyFile)));
+}
+$server->expose($opts['listen'].':'.$port, $bind);
+if ($tls && $httpPort) {
+    $server->expose($opts['listen'].':'.$httpPort);
+}
+
+try {
+    $server->start($handler, new DefaultErrorHandler());
+} catch (\Throwable $e) {
+    fwrite(STDERR, 'Could not start: '.$e->getMessage()."\n");
+    if (PHP_OS_FAMILY !== 'Windows' && ($port < 1024 || ($httpPort && $httpPort < 1024)) && function_exists('posix_geteuid') && posix_geteuid() !== 0) {
+        fwrite(STDERR, "Ports below 1024 need privileges. Allow them once for unprivileged users with:\n  sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80\n");
+    }
+    exit(1);
+}
+
+// behind nginx & co, browsers talk to port 443 and never see ours
+$publicPort = $opts['behind-proxy'] ? ($tls ? 443 : 80) : $port;
+$base = ($tls ? 'https' : 'http').'://'.$opts['host'].(($tls && $publicPort === 443) || (!$tls && $publicPort === 80) ? '' : ':'.$publicPort);
+$out(sprintf('Proxying %s%s -> %s', $base, $opts['prefix'], $opts['upstream']));
+if ($tls && $publicPort === 443 && $dns->isOverridden()) {
+    $out(sprintf('%s points here too, so signing in with GitHub works through the proxy.', $upstreamHost));
+} elseif ($dns->isOverridden()) {
+    $out(sprintf('WARNING: %s points here, but GitHub sign in returns to port 443 and the proxy is on %d. Run it without --port to sign in.', $upstreamHost, $port));
+} else {
+    $out(sprintf('To sign in, point %s at 127.0.0.1 in your hosts file (needs port 443), or import your session at %s%s/login', $upstreamHost, $base, DevNullProxy\LoginRelay::PATH));
+}
+if ($tls && !$opts['v']) {
+    $out('Run with -v to log requests. If the browser rejects the certificate, run: dev-null-proxy trust');
+}
+
+$signal = Amp\trapSignal([SIGINT, SIGTERM]);
+$server->stop();
